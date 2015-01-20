@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use 5.010;
+
+use autodie;
+
+use Time::Piece 'gmtime';
+use Time::Seconds 'ONE_WEEK';
+use File::Path 'remove_tree';
+
+
+sub guard (&) {
+    my ($thunk) = @_;
+    return bless { thunk => $thunk } => 'guard';
+    sub guard::DESTROY {
+        $_[0]->{thunk}->();
+    }
+}
+
+sub read_dir {
+    my ($dir) = @_;
+    opendir my($dirh), $dir;
+    my @names = readdir $dirh;
+    @names = grep { $_ ne '.' && $_ ne '..' } @names;
+    return @names;
+}
+
+sub shell {
+    my (@cmd) = @_;
+    system(@cmd) == 0
+        or die "system [@cmd] failed: errno '$!', wait code $?\n";
+}
+
+sub do_backup_into {
+    my ($dstdir) = @_;
+    my $old_umask = umask;
+    my $umask_fixer = guard { umask $old_umask };
+    # Create 'backup' copies of the DBs, readable by only us:ourgroup. This is
+    # atomic (within each single DB) and reasonably fast.
+    umask 027;
+    for my $dbshortname ('stats', 'weewx') {
+        shell(qq{sqlite3 $dbshortname.sdb '.backup $dstdir/$dbshortname.sdb'});
+    }
+    # Now create text dumps, world-readable. Since we're operating on a static
+    # copy of the DB, doesn't matter if they're atomic. (We could do this
+    # in-process within a single `BEGIN TRANSACTION`, in which case it would
+    # be, but that would require locking the DB for the duration of the dump
+    # (which might not be fast) and implementing our own I/O format. Getting
+    # the SQL dump for free is nice.)
+    umask 022;
+    for my $dbshortname ('stats', 'weewx') {
+        shell(qq{sqlite3 $dstdir/$dbshortname.sdb .dump > $dstdir/$dbshortname.sql});
+        my $tables_str = `sqlite3 $dstdir/$dbshortname.sdb .tables`;
+        my @tables = ($tables_str =~ m{(\S+)}g);  # whitespace-separated
+        for my $table (@tables) {
+            if ($table =~ /^[a-zA-Z0-9_]+$/) {
+                shell(join(" ",
+                            "sqlite3 -csv -header",
+                            "$dstdir/$dbshortname.sdb",
+                            "'select * from $table'",
+                            "> $dstdir/$dbshortname.$table.csv"));
+            }
+        }
+    }
+}
+
+sub make_new_backup {
+    my ($now) = @_;
+    my $now_str = sprintf "%s-%s-u%d", # 2015-01-10-001325-u1420866805
+                    $now->ymd, $now->hms(""), $now->epoch;
+    mkdir "backups/inprog.$now_str";
+    my $ok = eval { do_backup_into("backups/inprog.$now_str"); 1 };
+    if ($ok) {
+        rename("backups/inprog.$now_str", "backups/$now_str");
+        return 1;
+    } else {
+        rename("backups/inprog.$now_str", "backups/failed.$now_str");
+        print STDERR "$@";
+        return 0;
+    }
+}
+
+sub purge_old_backups {
+    my ($now) = @_;
+    my @subdirs = read_dir("backups");
+    my @completes;
+    my @incompletes;
+    for my $subdir (@subdirs) {
+        if ($subdir =~ m{^(inprog\.|failed\.|)[0-9-]+-u([0-9]+)$}) {
+            if ($1) { # "inprog." or "failed."
+                push @incompletes, {dir => $subdir, t => scalar gmtime $2};
+            } else {
+                push @completes, {dir => $subdir, t => scalar gmtime $2};
+            }
+        }
+    }
+    @completes = reverse sort { $a->{t} <=> $b->{t} } @completes;
+    @incompletes = reverse sort { $a->{t} <=> $b->{t} } @incompletes;
+
+    return if @completes < 2;  # require >= 2 complete backups...
+    return if $completes[1]{t} < $now - ONE_WEEK;  # ...in last week
+
+    # If most recent backup is from the future, either we were really slow
+    # and another run finished already or some clock is/was out of whack.
+    # In the first case, return and let the other run clean up. In the second,
+    # assume the sysadmin will fix stuff and return.
+    return if $completes[0]{t} > $now;  # assert(all completes <= $now)
+
+    # Delete everything before the most recent two backups. In particular,
+    # preserve recent failures or inprogresses.
+    my $purge_before = $completes[1]{t};
+
+    for my $dir_and_t (@completes, @incompletes) {
+        if ($dir_and_t->{t} < $purge_before) {
+            remove_tree("backups/" . $dir_and_t->{dir});
+        }
+    }
+}
+
+sub space_check {
+    open my($df), "df -kP . |";
+    my @lines = <$df>;
+    chomp(@lines);
+    close $df;
+
+    @lines > 1 && $lines[0] =~ /^Filesystem/  or die "Odd output from df\n";
+    for my $line (@lines[1 .. $#lines]) {
+        # POSIX says: "%s %d %d %d %d%% %s\n"
+        if ($line =~ /^ (?<fsname> .+) \s+
+                        (?<total> \d+) \s+
+                        (?<used> \d+) \s+
+                        (?<free> \d+) \s+
+                        (?<percentageUsed> \d+)% \s+
+                        (?<fsroot> .+) $/x)
+        {
+            if ($+{total} < 2 * 1024 * 1024) { # small filesystem, i.e. <= 2G
+                if ($+{percentageUsed} >= 95) {
+                    die "Filesystem too full:\n $lines[0]\n $line\nExiting.\n";
+                }
+            } else { # large filesystems
+                if ($+{free} < 100 * 1024) { # less than 100 MB free
+                    die "Filesystem too full:\n $lines[0]\n $line\nExiting.\n";
+                }
+            }
+        }
+    }
+}
+
+sub main {
+    @_ == 1 or die "Usage: $0 <dir>\n";
+    my ($dir) = @_;
+    chdir $dir;
+
+    space_check();
+
+    my $now = gmtime;
+    my $ok = make_new_backup($now);
+    purge_old_backups($now) if $ok;
+
+    return $ok;
+}
+
+exit(main(@ARGV) ? 0 : 1) unless caller;
+
